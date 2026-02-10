@@ -1,0 +1,2 @@
+Đây là thư mục đã chuyển dự án thành exe
+Hãy tải file zip về giải nén và chạy file pdfman.exe trong thư mục pdfman.
