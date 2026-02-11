@@ -1,2 +1,4 @@
-Đây là thư mục đã chuyển dự án thành exe
-Hãy tải file zip về giải nén và chạy file pdfman.exe trong thư mục pdfman.
+Hướng dẫn tải file exe để chạy
+Hãy chọn kênh "master" và tải về trong thư mục "dist" là ứng dụng pdfman
+trong thư mục pdfman sẽ có 1 thư mục thư viện python để bảo đảm ứng dụng chạy
+không được xóa thư mục đó.
