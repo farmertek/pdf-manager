@@ -1,11 +1,23 @@
 import tkinter as tk
 import os
+from typing import Literal, Optional
 from PIL import Image, ImageDraw, ImageTk
 
 # -----Tooltip class chú thích khi rà chuột vào widget-----
 class Tooltip:
     """Class tạo chú thích khi rà chuột vào widget"""
-    def __init__(self, widget, text, hover_delay=500, show_duration=2000, bg="#FFFFE1", wraplength=250, relief='solid', font_name='Tahoma', font_size=10):
+    def __init__(
+        self,
+        widget,
+        text,
+        hover_delay=500,
+        show_duration=2000,
+        bg="#FFFFE1",
+        wraplength=250,
+        relief: Literal["raised", "sunken", "flat", "ridge", "solid", "groove"] = "solid",
+        font_name="Tahoma",
+        font_size=10,
+    ):
         """
         Args:
             widget: Widget để attach tooltip
@@ -24,7 +36,7 @@ class Tooltip:
         self.show_duration = show_duration
         self.bg = bg
         self.wraplength = wraplength
-        self.relief = relief
+        self.relief: Literal["raised", "sunken", "flat", "ridge", "solid", "groove"] = relief
         self.font_name = font_name
         self.font_size = font_size
         self.tooltip_window = None
@@ -277,7 +289,7 @@ class IconButtonManager:
             print(f"[ERROR] Error creating default icons: {e}")
     
 
-    def load_icon(self, icon_name, size=(20, 20)):
+    def load_icon(self, icon_name, size=(20, 20)) -> Optional[ImageTk.PhotoImage]:
         """
         Tải icon từ file và chuyển đổi thành PhotoImage
         
@@ -314,9 +326,22 @@ class IconButtonManager:
             print(f"[ERROR] Error loading {icon_name}: {e}")
             return None
     
-    def create_button_with_icon(self, parent, icon_name, icon_size, text, command, 
-                               text_color="black", font_name="Consolas", font_size=11, 
-                               font_weight="normal", compound=tk.LEFT, padx=2, pady=2, **kwargs):
+    def create_button_with_icon(
+        self,
+        parent,
+        icon_name,
+        icon_size,
+        text,
+        command,
+        text_color="black",
+        font_name="Consolas",
+        font_size=11,
+        font_weight="normal",
+        compound: Literal["top", "left", "center", "right", "bottom", "none"] = "left",
+        padx=2,
+        pady=2,
+        **kwargs,
+    ):
         """
         Tạo button với icon
         
@@ -340,16 +365,19 @@ class IconButtonManager:
         """
         icon = self.load_icon(icon_name, size=icon_size)
         
+        image_value = icon if icon is not None else ""
+        compound_value = compound if icon is not None else "none"
+
         button = tk.Button(
             parent,
-            image=icon,
+            image=image_value,
             text=text,
-            compound=compound,
+            compound=compound_value,
             command=command,
             fg=text_color,
             font=(font_name, font_size, font_weight),
             padx=padx,
             pady=pady,
-            **kwargs
+            **kwargs,
         )
         return button

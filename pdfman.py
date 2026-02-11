@@ -4,7 +4,7 @@ from tkinter import ttk
 from gui import Tooltip, IconButtonManager     # sử dụng Tooltip và IconButtonManager cho các nút chức năng
 from PIL import Image, ImageTk
 import fitz  # PyMuPDF
-import PyPDF2
+from pypdf import PdfReader, PdfWriter
 import os
 import sys
 import gc
@@ -13,6 +13,11 @@ import tkinterdnd2
 from tkinterdnd2 import DND_FILES, DND_TEXT
 import shutil
 import webbrowser
+import traceback
+try:
+    import winreg
+except Exception:
+    winreg = None
 
 
 class PDFManagerApp:
@@ -31,21 +36,28 @@ class PDFManagerApp:
         # Set icon cho window chính từ thư mục icons
         try:
             if getattr(sys, 'frozen', False):
-                # Khi chạy từ PyInstaller exe:
-                # sys._MEIPASS points to dist/pdfman/_internal (where runtime is)
-                # nhưng icons folder nằm trong dist/pdfman/icons
-                base_dir = os.path.dirname(sys._MEIPASS)  # type: ignore
+                meipass = getattr(sys, '_MEIPASS', None)
+                if meipass:
+                    # Ưu tiên icons trong _internal (PyInstaller 6 onedir)
+                    self.base_dir = meipass
+                    icon_file = os.path.join(self.base_dir, 'icons', 'pdfman.ico')
+                    if not os.path.exists(icon_file):
+                        self.base_dir = os.path.dirname(meipass)
+                else:
+                    self.base_dir = os.path.dirname(os.path.abspath(__file__))
             else:
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-            
-            icon_file = os.path.join(base_dir, 'icons', 'pdfman.ico')
+                self.base_dir = os.path.dirname(os.path.abspath(__file__))
+
+            icon_file = os.path.join(self.base_dir, 'icons', 'pdfman.ico')
             if os.path.exists(icon_file):
                 self.root.iconbitmap(icon_file)
         except Exception:
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
             pass  # Sử dụng icon mặc định nếu không tìm thấy
 
         # --- Các biến trạng thái ---
         self.current_pdf_path = None
+        self.opened_file_count = 0
         self.page_images = {}  # Dict: visual_idx -> PhotoImage (chỉ lưu trang đã render)
         self.page_checkboxes = [] # Lưu trữ các biến của checkbox (IntVar)
         self.page_color_elements = []  # Lưu trữ các elements cần đổi màu (header_frame, checkbox, label)
@@ -57,8 +69,12 @@ class PDFManagerApp:
         self.zoom_level = 0.80  # Tỷ lệ zoom mặc định (80%)
         self.zoom_timer = None  # Timer để debounce zoom bằng chuột
         self.btn_save = None  # Tham chiếu nút Lưu File PDF mới để enable/disable
+        self.btn_open_pdf = None  # Tham chiếu nút Open PDF
+        self.btn_close_pdf = None  # Tham chiếu nút Close PDF
         self.btn_select_all = None  # Tham chiếu nút Select All/Deselect All
         self.select_all_state = False  # False = Deselect All, True = Select All
+        self.action_widgets = []  # Danh sách widgets trong action_frame
+        self.bottom_widgets = []  # Danh sách widgets trong bottom_frame
         
         # --- Lazy loading variables ---
         self.fitz_doc = None  # Giữ fitz document mở cho lazy rendering
@@ -70,13 +86,13 @@ class PDFManagerApp:
         self._gc_pending = 0  # Đếm số trang đã unload, gọi gc.collect() sau mỗi batch
         
         # --- Temp folder management ---
-        self.temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+        self.temp_dir = os.path.join(self.base_dir, "temp")
         self.backup_pdf_path = None
         self.combined_pdf_path = None
         self._create_temp_dir()
         
         # Khởi tạo IconButtonManager để quản lý icon cho button
-        self.icon_manager = IconButtonManager("icons")
+        self.icon_manager = IconButtonManager(os.path.join(self.base_dir, "icons"))
         
         # Gắn sự kiện đóng cửa sổ
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -89,6 +105,9 @@ class PDFManagerApp:
             # Nếu drag and drop không được hỗ trợ, tiếp tục chạy bình thường
             pass 
 
+        if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+            self._register_open_with()
+
         # --- Giao diện người dùng (GUI) ---
         
         # 1. Khung điều khiển trên cùng (Top Frame)
@@ -96,12 +115,18 @@ class PDFManagerApp:
         top_frame.pack(side=tk.TOP, fill=tk.X)
         # 1.1. Điều khiển canh trái trên cùng
         font_size_top = 11   # font size mặc định để icon size thay đổi theo font size (icon size = font size * 2)
-        btn_open_pdf = self.icon_manager.create_button_with_icon(top_frame, 'open_pdf.png', (font_size_top * 2, font_size_top * 2), "Open PDF", self.select_file, text_color="#FE3D03", font_size=font_size_top, font_weight="bold")
-        btn_open_pdf.pack(side=tk.LEFT, padx=(10, 5), pady=(5, 5))
-        Tooltip(btn_open_pdf, "Tìm file PDF để mở và quản lý\n(hoặc kéo thả PDF vào khung nội dung)")
+        self.btn_open_pdf = self.icon_manager.create_button_with_icon(top_frame, 'open_pdf.png', (font_size_top * 2, font_size_top * 2), "Open PDF", self.select_file, text_color="#FE3D03", font_size=font_size_top, font_weight="bold")
+        self.btn_open_pdf.pack(side=tk.LEFT, padx=(10, 5), pady=(5, 5))
+        Tooltip(self.btn_open_pdf, "Tìm file PDF để mở và quản lý\n(hoặc kéo thả PDF vào khung nội dung)")
+
+        # self.btn_close_pdf = self.icon_manager.create_button_with_icon(top_frame, 'reset.png', (font_size_top * 2, font_size_top * 2), "Close PDF", self.close_pdf, text_color="#B00020", font_size=font_size_top, state=tk.DISABLED)
+        self.btn_close_pdf=tk.Button(top_frame, width=14, text="✖ Close PDF", command=self.close_pdf, fg="#F88D01", font=("Consolas", font_size_top,"bold"), padx=2, state=tk.DISABLED)
+        self.btn_close_pdf.pack(side=tk.LEFT, padx=(10, 5), pady=(5, 5))
+        Tooltip(self.btn_close_pdf, "Đóng PDF hiện tại")
         self.lbl_file_info = tk.Label(top_frame, text="Chưa chọn file nào", bg="#e1e1e1", font=("Consolas", 10))
         self.lbl_file_info.pack(side=tk.LEFT)
         Tooltip(self.lbl_file_info, "Thông tin file PDF hiện tại")
+        
         # 1.2. Điều khiển canh phải trên cùng
         self.btn_save = self.icon_manager.create_button_with_icon(top_frame, 'save_pdf.png', (font_size_top * 2, font_size_top * 2), "SaveAs PDF", self.save_pdf, text_color="#00820F", font_size=font_size_top, state=tk.DISABLED)
         self.btn_save.pack(side=tk.RIGHT, padx=(5, 29))
@@ -140,7 +165,7 @@ class PDFManagerApp:
         Tooltip(btn_rotate_180, "Xoay các trang đã chọn ngược 180°")
 
         # btn_rotate_reset = self.icon_manager.create_button_with_icon(action_frame, 'reset.png', (font_size_action * 2, font_size_action * 2), "Reset 0°", self.reset_all_selected_pages, text_color="#9400D3", font_size=font_size_action)
-        btn_rotate_reset = tk.Button(action_frame, text="↩ Reset 0°", command=self.reset_all_selected_pages, fg="#9400D3", font=("Consolas", font_size_action,"bold"))
+        btn_rotate_reset = tk.Button(action_frame, text="↺ Reset 0°", command=self.reset_all_selected_pages, fg="#9400D3", font=("Consolas", font_size_action))
         btn_rotate_reset.pack(side=tk.LEFT, padx=(1,5))
         Tooltip(btn_rotate_reset, "Reset lại các trang đã chọn về 0°\n(trạng thái ban đầu khi mở file)")
 
@@ -157,9 +182,22 @@ class PDFManagerApp:
         Tooltip(btn_delete, "Xóa các trang đã chọn khỏi danh sách (không thể khôi phục sau khi đã lưu file PDF mới)",show_duration=3000)
 
         # 2.2. Điều khiển canh phải hành động
-        btn_reset_all = tk.Button(action_frame, text="↩ Reset All", command=self.reset_all, fg="#9400D3", font=("Consolas", 11, "bold"))
+        btn_reset_all = tk.Button(action_frame, width=13, text="⎌ Reset All", command=self.reset_all, fg="#9400D3", font=("Consolas", 11, "bold"))
         btn_reset_all.pack(side=tk.RIGHT, padx=(10,29))
         Tooltip(btn_reset_all, "Hoàn tác tất cả các thay đổi (xoay, xóa trang, di chuyển, thêm PDF) và tải lại file PDF ban đầu",show_duration=3000)
+
+        self.action_widgets = [
+            btn_add_pdf,
+            self.btn_select_all,
+            btn_rotate_cw,
+            btn_rotate_ccw,
+            btn_rotate_180,
+            btn_rotate_reset,
+            btn_move_up,
+            btn_move_down,
+            btn_delete,
+            btn_reset_all,
+        ]
         
         # 3. Khu vực hiển thị chính (Scrollable Canvas)
         main_container = tk.Frame(root)
@@ -230,6 +268,11 @@ class PDFManagerApp:
         self.zoom_entry.bind("<Return>", lambda e: self.apply_zoom())
         # nhãn Zoom
         tk.Label(view_frame, text="Zoom (%):", bg="#e1e1e1", font=("Consolas", 11)).pack(side=tk.RIGHT, padx=(28, 5))
+
+        self.bottom_widgets = [btn_apply_zoom, self.zoom_entry]
+
+        self._set_ui_state(False)
+        self._show_window()
         
 
     # --- Các hàm xử lý logic ---
@@ -240,6 +283,17 @@ class PDFManagerApp:
             os.makedirs(self.temp_dir, exist_ok=True)
         except Exception as e:
             print(f"Lỗi khi tạo temp folder: {e}")
+
+    def _show_window(self):
+        """Đảm bảo cửa sổ hiển thị sau khi khởi tạo."""
+        try:
+            self.root.update_idletasks()
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
     
     def _backup_pdf(self, keep_combined=False):
         """Backup PDF hiện tại vào temp folder"""
@@ -272,6 +326,96 @@ class PDFManagerApp:
         except Exception as e:
             print(f"Lỗi cleanup temp folder: {e}")
 
+    def _set_ui_state(self, has_pdf):
+        state = tk.NORMAL if has_pdf else tk.DISABLED
+        if self.btn_open_pdf:
+            self.btn_open_pdf.config(state=tk.DISABLED if has_pdf else tk.NORMAL)
+        if self.btn_close_pdf:
+            self.btn_close_pdf.config(state=tk.NORMAL if has_pdf else tk.DISABLED)
+        if self.btn_save:
+            self.btn_save.config(state=state if has_pdf else tk.DISABLED)  # type: ignore
+
+        for widget in self.action_widgets:
+            try:
+                widget.config(state=state)
+            except Exception:
+                pass
+
+        for widget in self.bottom_widgets:
+            try:
+                widget.config(state=state)
+            except Exception:
+                pass
+
+    def _is_path_in_temp(self, path):
+        try:
+            temp_root = os.path.abspath(self.temp_dir)
+            target = os.path.abspath(path)
+            return target.startswith(temp_root + os.sep)
+        except Exception:
+            return False
+
+    def _register_open_with(self):
+        if winreg is None:
+            return
+        try:
+            exe_path = os.path.abspath(sys.executable)
+            exe_name = os.path.basename(exe_path)
+            app_root = f"Software\\Classes\\Applications\\{exe_name}"
+            command_key = app_root + "\\shell\\open\\command"
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, command_key) as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, f'"{exe_path}" "%1"')
+
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, app_root) as key:
+                winreg.SetValueEx(key, "FriendlyAppName", 0, winreg.REG_SZ, "PDF Manager")
+
+            default_icon_key = app_root + "\\DefaultIcon"
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, default_icon_key) as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, f'"{exe_path}",0')
+
+            self._add_to_open_with_list(exe_name)
+        except Exception:
+            return
+
+    def _add_to_open_with_list(self, exe_name):
+        if winreg is None:
+            return
+        try:
+            owl_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.pdf\OpenWithList"
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, owl_path) as key:
+                existing = {}
+                idx = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(key, idx)
+                        existing[name] = value
+                        idx += 1
+                    except OSError:
+                        break
+
+                if exe_name in existing.values():
+                    return
+
+                for letter in "abcdefghijklmnopqrstuvwxyz":
+                    if letter not in existing:
+                        winreg.SetValueEx(key, letter, 0, winreg.REG_SZ, exe_name)
+                        mru = existing.get("MRUList", "")
+                        if letter not in mru:
+                            mru = letter + mru
+                        winreg.SetValueEx(key, "MRUList", 0, winreg.REG_SZ, mru)
+                        break
+        except Exception:
+            return
+
+    def _update_file_info_label(self):
+        if not self.current_pdf_path:
+            self.lbl_file_info.config(text="Chưa chọn file nào")
+            return
+        if self.opened_file_count > 1:
+            self.lbl_file_info.config(text=f"Đang mở: {self.opened_file_count} file PDF")
+        else:
+            self.lbl_file_info.config(text=f"Đang mở: {os.path.basename(self.current_pdf_path)}")
+
     def open_pdf_file(self, file_path):
         """
         Mở file PDF từ đường dẫn được cung cấp
@@ -299,7 +443,8 @@ class PDFManagerApp:
         self._force_cleanup_all_images()
         
         self.current_pdf_path = file_path
-        self.lbl_file_info.config(text=f"Đang mở: {os.path.basename(file_path)}")
+        self.opened_file_count = 1
+        self._update_file_info_label()
         self.rotation_states = {} # Reset trạng thái xoay khi mở file mới
         self.initial_rotation_states = {}  # Reset trạng thái ban đầu
         self.deleted_pages = set()  # Reset các trang bị xóa
@@ -309,6 +454,7 @@ class PDFManagerApp:
         self.btn_select_all.config(text="☑ Select All")  # type: ignore
         self.load_pdf_thumbnails()
         self.update_page_count()
+        self._set_ui_state(True)
         return True
 
     def select_file(self):
@@ -361,6 +507,8 @@ class PDFManagerApp:
                 valid_paths.remove(p)
         if not valid_paths:
             return False
+        if len(valid_paths) == 1:
+            return self.open_pdf_file(valid_paths[0])
         
         # === GIẢI PHÓNG BỘ NHỚ FILE CŨ TRƯỚC KHI MỞ FILE MỚI ===
         self._close_fitz_doc()
@@ -372,7 +520,8 @@ class PDFManagerApp:
             return False
         
         self.current_pdf_path = combined_path
-        self.lbl_file_info.config(text=f"Đang mở: {len(valid_paths)} file PDF")
+        self.opened_file_count = len(valid_paths)
+        self._update_file_info_label()
         self.rotation_states = {}
         self.initial_rotation_states = {}
         self.deleted_pages = set()
@@ -382,12 +531,57 @@ class PDFManagerApp:
         self.btn_select_all.config(text="☑ Select All")  # type: ignore
         self.load_pdf_thumbnails()
         self.update_page_count()
+        self._set_ui_state(True)
         
         messagebox.showinfo(
             "Thành công",
             f"Đã mở {len(valid_paths)} file PDF với tổng {total_pages} trang."
         )
         return True
+
+    def close_pdf(self):
+        """Đóng file PDF hiện tại và reset trạng thái UI"""
+        if not self.current_pdf_path:
+            return
+
+        if self.is_file_modified():
+            response = messagebox.askyesnocancel(
+                "File chưa lưu",
+                f"File '{os.path.basename(self.current_pdf_path)}' có thay đổi chưa được lưu.\n\nBạn có muốn lưu file trước khi đóng không?"
+            )
+            if response is None:
+                return
+            if response:
+                self.save_pdf()
+                if self.is_file_modified():
+                    return
+
+        self._close_fitz_doc()
+        self._force_cleanup_all_images()
+
+        self._cleanup_temp(keep_combined=False)
+        if self.current_pdf_path and self._is_path_in_temp(self.current_pdf_path):
+            try:
+                if os.path.exists(self.current_pdf_path):
+                    os.remove(self.current_pdf_path)
+            except Exception:
+                pass
+
+        self.current_pdf_path = None
+        self.opened_file_count = 0
+        self.backup_pdf_path = None
+        self.combined_pdf_path = None
+        self.rotation_states = {}
+        self.initial_rotation_states = {}
+        self.deleted_pages = set()
+        self.select_all_state = False
+        if self.btn_select_all:
+            self.btn_select_all.config(text="☑ Select All")
+
+        self._update_file_info_label()
+        self.lbl_selected_count.config(text="| Đã chọn: 0")
+        self.update_page_count()
+        self._set_ui_state(False)
 
     def _build_combined_pdf(self, file_paths):
         """Gộp nhiều PDF thành 1 file tạm, trả về (path, total_pages)."""
@@ -399,10 +593,10 @@ class PDFManagerApp:
             combined_name = "combined_open.pdf"
             self.combined_pdf_path = os.path.join(self.temp_dir, combined_name)
             
-            writer = PyPDF2.PdfWriter()
+            writer = PdfWriter()
             total_pages = 0
             for p in file_paths:
-                reader = PyPDF2.PdfReader(p)  # type: ignore
+                reader = PdfReader(p)  # type: ignore
                 for page in reader.pages:
                     writer.add_page(page)
                 total_pages += len(reader.pages)
@@ -433,8 +627,8 @@ class PDFManagerApp:
             False nếu file bị khóa không thể remove
         """
         try:
-            # Mở file với PyPDF2 để kiểm tra encryption
-            reader = PyPDF2.PdfReader(file_path)  # type: ignore
+            # Mở file với pypdf để kiểm tra encryption
+            reader = PdfReader(file_path)  # type: ignore
             
             # Kiểm tra xem file có bị encrypt không
             if reader.is_encrypted:
@@ -454,7 +648,7 @@ class PDFManagerApp:
                 # Decrypt thành công → file chỉ có restrictions (không có password)
                 # Tạo PDF mới không có restrictions (không hiển thị thông báo thành công)
                 try:
-                    writer = PyPDF2.PdfWriter()
+                    writer = PdfWriter()
                     
                     # Copy tất cả pages từ reader sang writer
                     for page_num in range(len(reader.pages)):
@@ -1145,7 +1339,7 @@ class PDFManagerApp:
         
         try:
             # Đọc file hiện tại
-            reader = PyPDF2.PdfReader(self.current_pdf_path)  # type: ignore
+            reader = PdfReader(self.current_pdf_path)  # type: ignore
             pages_list = list(reader.pages)
             new_selected_pages: list[int] = []  # Khởi tạo biến
             
@@ -1185,7 +1379,7 @@ class PDFManagerApp:
                 new_selected_pages = [p + 1 for p in selected_pages]
             
             # Ghi lại file
-            writer = PyPDF2.PdfWriter()
+            writer = PdfWriter()
             for page in pages_list:
                 writer.add_page(page)
             
@@ -1305,8 +1499,8 @@ class PDFManagerApp:
             self._close_fitz_doc()
             
             try:
-                reader = PyPDF2.PdfReader(self.current_pdf_path)  # type: ignore
-                writer = PyPDF2.PdfWriter()
+                reader = PdfReader(self.current_pdf_path)  # type: ignore
+                writer = PdfWriter()
 
                 for i in range(len(reader.pages)):
                     # Bỏ qua các trang bị xóa
@@ -1459,11 +1653,11 @@ class PDFManagerApp:
                 self._backup_pdf()
             
             # Đọc file hiện tại
-            reader_current = PyPDF2.PdfReader(self.current_pdf_path)  # type: ignore
-            writer = PyPDF2.PdfWriter()
+            reader_current = PdfReader(self.current_pdf_path)  # type: ignore
+            writer = PdfWriter()
             
             # Đọc các file mới và tính tổng số trang
-            readers_new = [PyPDF2.PdfReader(p) for p in valid_paths]  # type: ignore
+            readers_new = [PdfReader(p) for p in valid_paths]  # type: ignore
             new_pages_count = sum(len(r.pages) for r in readers_new)
             
             if position == "start":
@@ -1500,6 +1694,11 @@ class PDFManagerApp:
             # Lưu tạm thời vào file hiện tại
             with open(self.current_pdf_path, "wb") as f:  # type: ignore
                 writer.write(f)
+
+            if self.opened_file_count <= 0:
+                self.opened_file_count = 1
+            self.opened_file_count += len(valid_paths)
+            self._update_file_info_label()
             
             self.load_pdf_thumbnails()
             self.update_page_count()
@@ -1543,7 +1742,34 @@ class PDFManagerApp:
         self.root.destroy()
 
         
+def _write_startup_error(exc):
+    try:
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        log_path = os.path.join(base_dir, "startup_error.txt")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("Startup error:\n")
+            f.write("".join(traceback.format_exception(exc)))
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    root = tkinterdnd2.Tk()
-    app = PDFManagerApp(root)
-    root.mainloop()
+    try:
+        try:
+            root = tkinterdnd2.Tk()
+        except Exception:
+            root = tk.Tk()
+        app = PDFManagerApp(root)
+        if len(sys.argv) > 1:
+            arg_paths = [p for p in sys.argv[1:] if p and p.lower().endswith('.pdf') and os.path.exists(p)]
+            if arg_paths:
+                if len(arg_paths) == 1:
+                    app.open_pdf_file(arg_paths[0])
+                else:
+                    app.open_pdf_files(arg_paths)
+        root.mainloop()
+    except Exception as exc:
+        _write_startup_error(exc)
