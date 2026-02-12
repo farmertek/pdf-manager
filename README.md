@@ -1,4 +1,3 @@
-![Visitor Count](https://profile-counter.glitch.me/farmertek/count.svg)
 
 ĐÂY LÀ ỨNG DỤNG HỖ TRỢ QUẢN LÝ CÁC TRANG TRONG TÀI LIỆU PDF
 
@@ -13,3 +12,7 @@ bao gồm 2 công cụ là pdfman và pdflock
    đặt mật khẩu khó để bảo vệ PDF tốt hơn (tuy nhiên, cũng phải nhớ mật khẩu,
    nếu quên thì cũng rất khó mở lại PDF đó - riêng tác giả là không có cách nào)
    
+
+
+
+![Lượt xem](https://hits.dwyl.com/farmertek/pdf-manager.svg)
