@@ -123,7 +123,7 @@ class PDFManagerApp:
         self.btn_close_pdf=tk.Button(top_frame, width=14, text="✖ Close PDF", command=self.close_pdf, fg="#F88D01", font=("Consolas", font_size_top,"bold"), padx=2, state=tk.DISABLED)
         self.btn_close_pdf.pack(side=tk.LEFT, padx=(10, 5), pady=(5, 5))
         Tooltip(self.btn_close_pdf, "Đóng PDF hiện tại")
-        self.lbl_file_info = tk.Label(top_frame, text="Chưa chọn file nào", bg="#e1e1e1", font=("Consolas", 10))
+        self.lbl_file_info = tk.Label(top_frame, width=95, text="Chưa chọn file nào", anchor='w', bg="#e1e1e1", font=("Tahoma", 9))
         self.lbl_file_info.pack(side=tk.LEFT)
         Tooltip(self.lbl_file_info, "Thông tin file PDF hiện tại")
         
@@ -261,11 +261,14 @@ class PDFManagerApp:
         # nút Apply Zoom
         btn_apply_zoom = tk.Button(view_frame, text="Apply", command=self.apply_zoom, font=("Consolas", 11))
         btn_apply_zoom.pack(side=tk.RIGHT, padx=(1,29))
+        Tooltip(btn_apply_zoom, "Nhấn để áp dụng zoom PDF\ntheo tỷ lệ đã nhập trong ô zoom")
+
         # ô nhập tỷ lệ zoom
         self.zoom_entry = tk.Entry(view_frame, width=5, font=("Consolas", 11))
         self.zoom_entry.insert(0, "80")  # Mặc định 80%
         self.zoom_entry.pack(side=tk.RIGHT, padx=(2,1))
         self.zoom_entry.bind("<Return>", lambda e: self.apply_zoom())
+        Tooltip(self.zoom_entry, "Nhập tỷ lệ zoom PDF (%)\nvà nhấn Enter hoặc Apply")
         # nhãn Zoom
         tk.Label(view_frame, text="Zoom (%):", bg="#e1e1e1", font=("Consolas", 11)).pack(side=tk.RIGHT, padx=(28, 5))
 

@@ -87,8 +87,22 @@ class PDFLockTool:
             # Đọc PDF gốc
             reader = PdfReader(input_pdf_path)
             if reader.is_encrypted:
-                decrypt_result = reader.decrypt(open_password or password or "")
-                if decrypt_result == 0:
+                candidate_passwords = []
+                for candidate in (open_password, "", password):
+                    normalized = (candidate or "").strip()
+                    if normalized not in candidate_passwords:
+                        candidate_passwords.append(normalized)
+
+                decrypted = False
+                for candidate in candidate_passwords:
+                    try:
+                        if reader.decrypt(candidate) != 0:
+                            decrypted = True
+                            break
+                    except Exception:
+                        continue
+
+                if not decrypted:
                     return False, "Password mở file PDF không đúng hoặc bị thiếu."
             writer = PdfWriter()
             
@@ -99,12 +113,10 @@ class PDFLockTool:
             
             # Đặt encryption với restrictions
             # pypdf sử dụng user_password (password để mở) và owner_password (password để unlock restrictions)
-            user_password = password  # Password để mở PDF
+            user_password = (password or "").strip()  # Password để mở PDF
             owner_password = "owner"   # Password để bypass restrictions (lưu trữ nội bộ)
-            
-            # Áp dụng restrictions
             writer.encrypt(
-                user_password=user_password if user_password else "",
+                user_password=user_password,
                 owner_password=owner_password,
                 permissions_flag=UserAccessPermissions(
                     self._generate_permissions_flag(restrictions)
@@ -255,6 +267,9 @@ class PDFLockGUI:
         self.select_all_state = False
         self.ui_widgets = []
         self.restriction_checkbuttons = []
+        self.restriction_checkbuttons_map = {}
+        self.password_var = tk.StringVar()
+        self.password_confirm_var = tk.StringVar()
         
         # === MAIN FRAME ===
         main_frame = tk.Frame(root, padx=10, pady=5)
@@ -263,9 +278,9 @@ class PDFLockGUI:
         # === TIÊU ĐỀ ===
         title_label = tk.Label(
             main_frame,
-            text="Tool lock/unlock PDF",
+            text="Tool lock/unlock PDF with Restrictions (Encryption AES-256)",
             font=("Consolas", 12, "bold"),
-            fg="#ea8208"
+            fg="#ff01ff"
         )
         title_label.pack(pady=(0, 5))
         
@@ -392,6 +407,7 @@ class PDFLockGUI:
             )
             chk.pack(fill=tk.X, padx=(150, 5), pady=1)
             self.restriction_checkbuttons.append(chk)
+            self.restriction_checkbuttons_map[key] = chk
         
         # === PASSWORD ===
         password_frame = tk.LabelFrame(
@@ -407,11 +423,11 @@ class PDFLockGUI:
                 font=("Consolas", 11), fg="#666").pack(anchor=tk.W, pady=(0, 1))
         
         tk.Label(password_frame, text="Password:", font=("Consolas", 11)).pack(anchor=tk.W)
-        self.password_entry = tk.Entry(password_frame, show="*", font=("Consolas", 11), width=40)
+        self.password_entry = tk.Entry(password_frame, textvariable=self.password_var, show="*", font=("Consolas", 11), width=40)
         self.password_entry.pack(fill=tk.X, padx=5, pady=(1, 1))
 
         tk.Label(password_frame, text="Nhập lại Password:", font=("Consolas", 11)).pack(anchor=tk.W)
-        self.password_confirm_entry = tk.Entry(password_frame, show="*", font=("Consolas", 11), width=40)
+        self.password_confirm_entry = tk.Entry(password_frame, textvariable=self.password_confirm_var, show="*", font=("Consolas", 11), width=40)
         self.password_confirm_entry.pack(fill=tk.X, padx=5, pady=(1, 1))
         
         # === NÚT HOẠT ĐỘNG ===
@@ -431,6 +447,7 @@ class PDFLockGUI:
             cursor="hand2"
         )
         self.btn_lock.pack(side=tk.LEFT, padx=(0, 10))
+        Tooltip(self.btn_lock, "Khóa PDF với các restrictions đã chọn\nvà password đã nhập (nếu có)")
 
         self.btn_unlock = tk.Button(
             button_frame,
@@ -445,7 +462,8 @@ class PDFLockGUI:
             cursor="hand2"
         )
         self.btn_unlock.pack(side=tk.LEFT)
-
+        Tooltip(self.btn_unlock, "Mở khóa PDF đã bị khóa")
+        
         tk.Label(button_frame, text="PDF được lock mã hóa AES-256, nên đặt password khó để bảo vệ file tốt hơn", font=("Consolas", 10, "bold")).pack(side=tk.LEFT, anchor=tk.W, padx=5, pady=(5, 2))
 
         # Khung giới thiệu (Bottom Frame)
@@ -479,6 +497,7 @@ class PDFLockGUI:
         self.ui_widgets.extend(self.restriction_checkbuttons)
         self._set_ui_state(False)
         self._show_window()
+        self._bind_state_handlers()
     
     def browse_file(self):
         """Cho user chọn file PDF"""
@@ -541,6 +560,7 @@ class PDFLockGUI:
         self.initial_restrictions = restrictions.copy()
         self._apply_restrictions_to_ui(restrictions)
         self._sync_select_all_state()
+        self._update_lock_button_state()
     
     def lock_pdf(self):
         """Khóa PDF với restrictions được chọn"""
@@ -559,10 +579,14 @@ class PDFLockGUI:
             'copy_accessibility': self.check_vars.get('copy_accessibility', tk.BooleanVar(value=False)).get(),
             'comment': self.check_vars.get('comment', tk.BooleanVar(value=False)).get(),
         }
+
+        if not any(restrictions.values()) and not (self.password_var.get() or "").strip():
+            messagebox.showwarning("Cảnh báo", "Vui lòng chọn ít nhất 1 tính năng cần khóa hoặc nhập password.")
+            return
         
         # Lấy password
-        password = self.password_entry.get()
-        password_confirm = self.password_confirm_entry.get()
+        password = self.password_var.get()
+        password_confirm = self.password_confirm_var.get()
         if password != password_confirm:
             messagebox.showerror("Lỗi", "Password nhập lại không khớp.")
             return
@@ -605,7 +629,7 @@ class PDFLockGUI:
             messagebox.showwarning("Cảnh báo", "Vui lòng chọn file PDF trước!")
             return
 
-        open_password = self.open_password or self.password_entry.get()
+        open_password = self.open_password or self.password_var.get()
         if open_password == "":
             open_password = self._prompt_password(os.path.basename(self.selected_file)) or ""
 
@@ -637,15 +661,19 @@ class PDFLockGUI:
         self._set_password_fields("")
         for var in self.check_vars.values():
             var.set(False)
+        for key in self.check_vars.keys():
+            self._update_restriction_style(key)
         self.select_all_state = False
         self._sync_select_all_state()
         self._set_encryption_label(None)
         self._set_ui_state(False)
+        self._update_lock_button_state()
 
     def reset_restrictions(self):
         if self.initial_restrictions:
             self._apply_restrictions_to_ui(self.initial_restrictions)
         self._sync_select_all_state()
+        self._update_lock_button_state()
 
     def toggle_select_all(self):
         if self.select_all_state:
@@ -657,6 +685,9 @@ class PDFLockGUI:
                 var.set(True)
             self.select_all_state = True
         self._update_select_all_label()
+        for key in self.check_vars.keys():
+            self._update_restriction_style(key)
+        self._update_lock_button_state()
 
     def _sync_select_all_state(self):
         all_selected = all(var.get() for var in self.check_vars.values())
@@ -669,17 +700,55 @@ class PDFLockGUI:
         else:
             self.btn_toggle_all.config(text="☑ Select All")
 
+    def _bind_state_handlers(self):
+        for key, var in self.check_vars.items():
+            var.trace_add("write", lambda *_args, k=key: self._on_restriction_toggle(k))
+
+        self.password_var.trace_add("write", lambda *_args: self._update_lock_button_state())
+        self.password_confirm_var.trace_add("write", lambda *_args: self._update_lock_button_state())
+
+        for key in self.check_vars.keys():
+            self._update_restriction_style(key)
+        self._update_lock_button_state()
+
+    def _on_restriction_toggle(self, key):
+        self._update_restriction_style(key)
+        self._sync_select_all_state()
+        self._update_lock_button_state()
+
+    def _update_restriction_style(self, key):
+        chk = self.restriction_checkbuttons_map.get(key)
+        if not chk:
+            return
+        if self.check_vars.get(key, tk.BooleanVar(value=False)).get():
+            chk.config(fg="#ea8208", font=("Consolas", 11, "bold"))
+        else:
+            chk.config(fg="#000", font=("Consolas", 11, "normal"))
+
+    def _update_lock_button_state(self):
+        if not self.selected_file:
+            try:
+                self.btn_lock.config(state=tk.DISABLED)
+            except Exception:
+                pass
+            return
+
+        has_restriction = any(var.get() for var in self.check_vars.values())
+        password = (self.password_var.get() or "").strip()
+        state = tk.NORMAL if (has_restriction or password) else tk.DISABLED
+        try:
+            self.btn_lock.config(state=state)
+        except Exception:
+            pass
+
     def _set_password_fields(self, password):
-        self.password_entry.delete(0, tk.END)
-        self.password_confirm_entry.delete(0, tk.END)
-        if password:
-            self.password_entry.insert(0, password)
-            self.password_confirm_entry.insert(0, password)
+        self.password_var.set(password or "")
+        self.password_confirm_var.set(password or "")
 
     def _prompt_password(self, filename):
         return simpledialog.askstring(
             "Nhập Password",
-            f"File '{filename}' được bảo vệ bằng password.\nVui lòng nhập password để mở:",
+            f"Nhập password để mở PDF có 'restrictions'\n(nếu không đặt password thì bỏ trống => OK)\nFile: '{filename}'",
             show="*"
         )
 
@@ -738,6 +807,8 @@ class PDFLockGUI:
         for key, var in self.check_vars.items():
             if key in restrictions:
                 var.set(bool(restrictions[key]))
+                self._update_restriction_style(key)
+        self._update_lock_button_state()
 
     def _set_encryption_label(self, reader):
         if reader is None or not getattr(reader, "is_encrypted", False):
@@ -815,6 +886,7 @@ class PDFLockGUI:
             self.select_all_state = False
             self._update_select_all_label()
             self.lbl_encryption_info.config(text="File không được mã hóa")
+        self._update_lock_button_state()
 
     def _register_open_with(self):
         if winreg is None:
