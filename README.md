@@ -14,6 +14,8 @@ Bao gồm 2 công cụ:
 
 Có hỗ trợ menu chuột phải (right-click) => "Open With" trong windows Explorer
 
+File exe trong thư mục `dist/` bao gồm 2 file `.rar` => tải về và giải nén ra thư mục `pdfman/`
+
 **LƯU Ý**: Ứng dụng này chỉ tối ưu để quản lý trang trong PDF, không tối ưu để đọc PDF.
 
 Đây là phần mềm của người không chuyên, tạo ra để phục vụ nhu cầu cá nhân.
