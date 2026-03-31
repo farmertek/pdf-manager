@@ -27,6 +27,6 @@ Nếu có gì sơ sót mong các cao nhân bỏ qua ^^. Thank you very much!
 
 
 ---
-## Phien ban lien quan
+## Phiên bản liên quan
 - Browser Extension (Chromium): https://github.com/farmertek/pdfman-chromium-extension
-- Python PDF Manager (repo nay): https://github.com/farmertek/pdf-manager
+- Python PDF Manager (repo này): https://github.com/farmertek/pdf-manager
