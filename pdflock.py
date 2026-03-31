@@ -10,8 +10,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 import importlib
 import webbrowser
-from pypdf import PdfReader, PdfWriter
-from pypdf.constants import UserAccessPermissions
+from pypdf import PdfReader, PdfWriter  # type: ignore
+from pypdf.constants import UserAccessPermissions  # type: ignore
+try:
+    from pypdf.generic import Destination  # type: ignore
+except Exception:
+    Destination = None  # type: ignore
 from gui import Tooltip     # sử dụng tooltip text từ gui
 import os
 import sys
@@ -31,6 +35,117 @@ except Exception:
     DND_FILES = None
 
 AES256_ALGORITHM = "AES-256"
+
+
+def _check_cryptography_for_aes():
+    """
+    Kiểm tra thư viện cryptography có sẵn và đủ phiên bản cho AES-256 không.
+    Returns: (ok: bool, message: str)
+    """
+    try:
+        import cryptography  # type: ignore[import-untyped]
+    except ImportError:
+        python_path = getattr(sys, "executable", "python")
+        if getattr(sys, "frozen", False):
+            return False, (
+                "Bản exe chưa được build kèm thư viện 'cryptography'.\n\n"
+                "Để tính năng Lock PDF (AES-256) chạy trong exe:\n"
+                "1. Cài cryptography trong môi trường build:\n"
+                "   pip install \"cryptography>=3.1\"\n"
+                "2. Build lại exe (spec đã khai báo hiddenimports cryptography)."
+            )
+        # Trên PowerShell (Windows) cần dùng & trước đường dẫn có khoảng trắng
+        _pip_cmd = f'"{python_path}" -m pip install "cryptography>=3.1"'
+        if sys.platform == "win32" and " " in python_path:
+            _pip_ps = f'& "{python_path}" -m pip install "cryptography>=3.1"'
+            _pip_hint = f"PowerShell: {_pip_ps}\n  CMD / bash: {_pip_cmd}"
+        else:
+            _pip_hint = _pip_cmd
+        return False, (
+            "Thư viện 'cryptography' chưa có trong môi trường Python đang chạy ứng dụng.\n\n"
+            "Ứng dụng đang dùng Python:\n  " + python_path + "\n\n"
+            "Cài đúng cho Python trên:\n  " + _pip_hint
+        )
+    try:
+        version = getattr(cryptography, "__version__", "0")
+        # So sánh version (đơn giản: 3.1, 41.0, ...)
+        parts = version.split(".")[:2]
+        major = int(parts[0]) if parts else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        if (major, minor) < (3, 1):
+            return False, (
+                f"Phiên bản cryptography hiện tại là {version}.\n\n"
+                "AES-256 yêu cầu cryptography >= 3.1.\n"
+                "Nâng cấp bằng lệnh:\n  pip install --upgrade \"cryptography>=3.1\""
+            )
+        return True, ""
+    except (ValueError, TypeError):
+        return False, (
+            "Không xác định được phiên bản cryptography.\n\n"
+            "Thử nâng cấp: pip install --upgrade \"cryptography>=3.1\""
+        )
+
+
+def _build_outline_for_writer(reader, writer, page_index_map=None):
+    """
+    Sao chép/cập nhật toàn bộ outline từ reader sang writer.
+    
+    page_index_map: dict[old_index] -> new_index
+    Nếu None: dùng ánh xạ 1-1 (0..N-1).
+    """
+    if Destination is None:
+        return
+    destination_cls = Destination
+    try:
+        outlines = reader.outline
+    except Exception:
+        return
+
+    if not outlines:
+        return
+
+    if page_index_map is None:
+        page_index_map = {i: i for i in range(len(reader.pages))}
+
+    def _add_outline_list(items, parent=None):
+        last_created_ref = {"item": None}
+        for item in items:
+            if isinstance(item, list):
+                # Danh sách con: gán làm con của last_created (nếu có)
+                target_parent = last_created_ref["item"] if last_created_ref["item"] is not None else parent
+                _add_outline_list(item, parent=target_parent)
+            else:
+                if destination_cls is None or not isinstance(item, destination_cls):
+                    continue
+                try:
+                    old_page = reader.get_destination_page_number(item)
+                except Exception:
+                    old_page = None
+                if old_page is None:
+                    continue
+                if old_page not in page_index_map:
+                    # Trang đã bị xóa → bỏ bookmark này
+                    continue
+                new_page = page_index_map[old_page]
+                try:
+                    title = getattr(item, "title", "") or ""
+                except Exception:
+                    title = ""
+                try:
+                    last_created_ref["item"] = writer.add_outline_item(
+                        title=title,
+                        page_number=new_page,
+                        parent=parent,
+                    )
+                except Exception:
+                    # Nếu có lỗi khi thêm outline thì bỏ qua node này
+                    continue
+
+    try:
+        _add_outline_list(outlines, parent=None)
+    except Exception:
+        # Không để lỗi outline làm hỏng quá trình ghi PDF
+        return
 
 
 class PDFLockTool:
@@ -107,23 +222,46 @@ class PDFLockTool:
             writer = PdfWriter()
             
             # Copy tất cả pages
-            for page_num in range(len(reader.pages)):
-                page = reader.pages[page_num]
+            for page in reader.pages:
                 writer.add_page(page)
             
+            # Giữ nguyên bookmark/outline của PDF gốc
+            try:
+                _build_outline_for_writer(
+                    reader=reader,
+                    writer=writer,
+                    page_index_map={i: i for i in range(len(reader.pages))}
+                )
+            except Exception:
+                pass
+            
+            # Kiểm tra cryptography trước khi dùng AES-256
+            crypto_ok, crypto_msg = _check_cryptography_for_aes()
+            if not crypto_ok:
+                return False, crypto_msg
+
             # Đặt encryption với restrictions
-            # pypdf sử dụng user_password (password để mở) và owner_password (password để unlock restrictions)
+            # pypdf sử dụng user_password (password để mở) và owner_password (password để bypass restrictions)
             user_password = (password or "").strip()  # Password để mở PDF
             owner_password = "owner"   # Password để bypass restrictions (lưu trữ nội bộ)
-            writer.encrypt(
-                user_password=user_password,
-                owner_password=owner_password,
-                permissions_flag=UserAccessPermissions(
-                    self._generate_permissions_flag(restrictions)
-                ),
-                algorithm=AES256_ALGORITHM,
-            )
-            
+            try:
+                writer.encrypt(
+                    user_password=user_password,
+                    owner_password=owner_password,
+                    permissions_flag=UserAccessPermissions(
+                        self._generate_permissions_flag(restrictions)
+                    ),
+                    algorithm=AES256_ALGORITHM,
+                )
+            except Exception as enc_err:
+                err_text = str(enc_err).strip().lower()
+                if "cryptography" in err_text or "aes" in err_text:
+                    return False, (
+                        "Lỗi khi mã hóa AES-256.\n\n"
+                        + (crypto_msg if not crypto_ok else f"Chi tiết: {enc_err}\n\nThử cài/cập nhật: pip install \"cryptography>=3.1\"")
+                    )
+                raise
+
             # Ghi file PDF đã khóa
             with open(output_pdf_path, "wb") as output_file:
                 writer.write(output_file)
@@ -151,9 +289,18 @@ class PDFLockTool:
                     return False, "Password mở file PDF không đúng hoặc bị thiếu."
 
             writer = PdfWriter()
-            for page_num in range(len(reader.pages)):
-                page = reader.pages[page_num]
+            for page in reader.pages:
                 writer.add_page(page)
+
+            # Giữ nguyên bookmark/outline của PDF gốc
+            try:
+                _build_outline_for_writer(
+                    reader=reader,
+                    writer=writer,
+                    page_index_map={i: i for i in range(len(reader.pages))}
+                )
+            except Exception:
+                pass
 
             with open(output_pdf_path, "wb") as output_file:
                 writer.write(output_file)
@@ -262,7 +409,9 @@ class PDFLockGUI:
         
         self.locker = PDFLockTool(root)
         self.selected_file = None
+        self.selected_files = []
         self.open_password = ""
+        self.open_passwords = {}
         self.initial_restrictions = {}
         self.select_all_state = False
         self.ui_widgets = []
@@ -501,13 +650,13 @@ class PDFLockGUI:
     
     def browse_file(self):
         """Cho user chọn file PDF"""
-        file_path = filedialog.askopenfilename(
+        file_paths = filedialog.askopenfilenames(
             title="Chọn file PDF để lock/unlock",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
         )
         
-        if file_path:
-            self.open_file(file_path)
+        if file_paths:
+            self.open_files(list(file_paths))
 
     def _show_window(self):
         """Đảm bảo cửa sổ hiển thị sau khi khởi tạo."""
@@ -525,46 +674,73 @@ class PDFLockGUI:
             files = self.root.tk.splitlist(event.data)
             if not files:
                 return
-            file_path = files[0].strip("{}")
-            if file_path and file_path.lower().endswith('.pdf'):
-                self.open_file(file_path)
+            file_paths = [f.strip("{}") for f in files if f and f.strip("{}").lower().endswith('.pdf')]
+            if file_paths:
+                self.open_files(file_paths)
         except Exception:
             pass
 
-    def open_file(self, file_path):
-        if not file_path or not os.path.exists(file_path):
-            messagebox.showerror("Lỗi", "File không tồn tại hoặc đường dẫn không hợp lệ.")
-            return
-        if not file_path.lower().endswith('.pdf'):
-            messagebox.showerror("Lỗi", "Chỉ chấp nhận file PDF (.pdf)")
+    def open_files(self, file_paths):
+        valid_paths = [p for p in file_paths if p and os.path.exists(p) and p.lower().endswith('.pdf')]
+        if not valid_paths:
+            messagebox.showerror("Lỗi", "Không có file PDF hợp lệ để mở.")
             return
 
-        reader = PdfReader(file_path)
-        open_password = ""
-        if reader.is_encrypted:
-            open_password = self._prompt_password(os.path.basename(file_path))
-            if open_password is None:
-                return
-            decrypt_result = reader.decrypt(open_password)
-            if decrypt_result == 0:
-                messagebox.showerror("Lỗi", "Password không đúng. Vui lòng thử lại.")
-                return
+        loaded_paths = []
+        passwords = {}
+        first_reader = None
 
-        self.selected_file = file_path
-        self.open_password = open_password
-        self.file_label.config(text=os.path.basename(file_path), fg="#000")
+        for file_path in valid_paths:
+            try:
+                reader = PdfReader(file_path)
+                open_password = ""
+                if reader.is_encrypted:
+                    open_password = self._prompt_password(os.path.basename(file_path))
+                    if open_password is None:
+                        continue
+                    decrypt_result = reader.decrypt(open_password)
+                    if decrypt_result == 0:
+                        messagebox.showerror("Lỗi", f"Password không đúng: {os.path.basename(file_path)}")
+                        continue
+
+                loaded_paths.append(file_path)
+                passwords[file_path] = open_password or ""
+                if first_reader is None:
+                    first_reader = reader
+            except Exception as e:
+                messagebox.showerror("Lỗi", f"Không thể mở file '{os.path.basename(file_path)}': {e}")
+
+        if not loaded_paths:
+            return
+
+        self.selected_files = loaded_paths
+        self.selected_file = loaded_paths[0]
+        self.open_passwords = passwords
+        self.open_password = passwords.get(self.selected_file, "")
+
+        if len(loaded_paths) == 1:
+            self.file_label.config(text=os.path.basename(loaded_paths[0]), fg="#000")
+        else:
+            self.file_label.config(text=f"Đang chọn {len(loaded_paths)} file PDF", fg="#000")
+
         self._set_ui_state(True)
-        self._set_password_fields(open_password)
-        self._set_encryption_label(reader)
-        restrictions = self._read_pdf_restrictions(reader)
-        self.initial_restrictions = restrictions.copy()
-        self._apply_restrictions_to_ui(restrictions)
+        self._set_password_fields("")
+
+        if first_reader is not None:
+            self._set_encryption_label(first_reader)
+            restrictions = self._read_pdf_restrictions(first_reader)
+            self.initial_restrictions = restrictions.copy()
+            self._apply_restrictions_to_ui(restrictions)
+
         self._sync_select_all_state()
         self._update_lock_button_state()
+
+    def open_file(self, file_path):
+        self.open_files([file_path])
     
     def lock_pdf(self):
         """Khóa PDF với restrictions được chọn"""
-        if not self.selected_file:
+        if not self.selected_files:
             messagebox.showwarning("Cảnh báo", "Vui lòng chọn file PDF trước!")
             return
         
@@ -591,71 +767,96 @@ class PDFLockGUI:
             messagebox.showerror("Lỗi", "Password nhập lại không khớp.")
             return
         
-        # Tạo đường dẫn file output (thêm _locked vào tên file)
-        base_path = self.selected_file
-        name, ext = os.path.splitext(base_path)
-        output_path = f"{name}_locked{ext}"
-        
-        # Khóa PDF
-        success, message = self.locker.lock_pdf(
-            input_pdf_path=self.selected_file,
-            output_pdf_path=output_path,
-            restrictions=restrictions,
-            password=password,
-            open_password=self.open_password
-        )
-        
-        if success:
+        success_files = []
+        failed_files = []
+
+        for input_path in self.selected_files:
+            name, ext = os.path.splitext(input_path)
+            output_path = f"{name}_locked{ext}"
+            success, message = self.locker.lock_pdf(
+                input_pdf_path=input_path,
+                output_pdf_path=output_path,
+                restrictions=restrictions,
+                password=password,
+                open_password=self.open_passwords.get(input_path, "")
+            )
+            if success:
+                success_files.append(output_path)
+            else:
+                failed_files.append((input_path, message))
+
+        if failed_files:
+            fail_text = "\n".join([f"- {os.path.basename(p)}: {m}" for p, m in failed_files])
+            messagebox.showerror(
+                "Lỗi",
+                f"Khóa PDF thất bại {len(failed_files)}/{len(self.selected_files)} file:\n{fail_text}"
+            )
+
+        if success_files:
+            preview = "\n".join([f"- {os.path.basename(p)}" for p in success_files[:10]])
+            if len(success_files) > 10:
+                preview += f"\n... và {len(success_files) - 10} file khác"
+
             messagebox.showinfo(
                 "Thành công",
-                f"{message}\n\n"
-                f"File đã lưu tại:\n{output_path}\n\n"
-                f"Restrictions được áp dụng:\n"
-                f"- In: {'Khóa' if restrictions['print'] else 'Cho phép'}\n"
-                f"- Copy: {'Khóa' if restrictions['copy'] else 'Cho phép'}\n"
-                f"- Sửa: {'Khóa' if restrictions['modify'] else 'Cho phép'}\n"
-                f"- Comment: {'Khóa' if restrictions['annotate'] else 'Cho phép'}\n"
-                f"- Form: {'Khóa' if restrictions['fill'] else 'Cho phép'}\n"
-                f"- Extract: {'Khóa' if restrictions['extract'] else 'Cho phép'}\n"
-                f"- Copy Accessibility: {'Khóa' if restrictions['copy_accessibility'] else 'Cho phép'}\n"
-                f"- Commenting: {'Khóa' if restrictions['comment'] else 'Cho phép'}"
+                f"Đã khóa thành công {len(success_files)}/{len(self.selected_files)} file PDF.\n\n"
+                f"Tên file lưu vẫn theo quy tắc cũ (_locked):\n{preview}"
             )
-            self.clear_form()
-        else:
-            messagebox.showerror("Lỗi", message)
+            if not failed_files:
+                self.clear_form()
 
     def unlock_pdf(self):
-        if not self.selected_file:
+        if not self.selected_files:
             messagebox.showwarning("Cảnh báo", "Vui lòng chọn file PDF trước!")
             return
 
-        open_password = self.open_password or self.password_var.get()
-        if open_password == "":
-            open_password = self._prompt_password(os.path.basename(self.selected_file)) or ""
+        success_files = []
+        failed_files = []
 
-        base_path = self.selected_file
-        name, ext = os.path.splitext(base_path)
-        output_path = f"{name}_unlocked{ext}"
+        for input_path in self.selected_files:
+            base_open_password = self.open_passwords.get(input_path, "") or self.password_var.get()
+            if base_open_password == "":
+                base_open_password = self._prompt_password(os.path.basename(input_path)) or ""
 
-        success, message = self.locker.unlock_pdf(
-            input_pdf_path=self.selected_file,
-            output_pdf_path=output_path,
-            open_password=open_password
-        )
+            name, ext = os.path.splitext(input_path)
+            output_path = f"{name}_unlocked{ext}"
 
-        if success:
+            success, message = self.locker.unlock_pdf(
+                input_pdf_path=input_path,
+                output_pdf_path=output_path,
+                open_password=base_open_password
+            )
+
+            if success:
+                success_files.append(output_path)
+            else:
+                failed_files.append((input_path, message))
+
+        if failed_files:
+            fail_text = "\n".join([f"- {os.path.basename(p)}: {m}" for p, m in failed_files])
+            messagebox.showerror(
+                "Lỗi",
+                f"Mở khóa PDF thất bại {len(failed_files)}/{len(self.selected_files)} file:\n{fail_text}"
+            )
+
+        if success_files:
+            preview = "\n".join([f"- {os.path.basename(p)}" for p in success_files[:10]])
+            if len(success_files) > 10:
+                preview += f"\n... và {len(success_files) - 10} file khác"
             messagebox.showinfo(
                 "Thành công",
-                f"{message}\n\nFile đã lưu tại:\n{output_path}"
+                f"Đã mở khóa thành công {len(success_files)}/{len(self.selected_files)} file PDF.\n\n"
+                f"Tên file lưu vẫn theo quy tắc cũ (_unlocked):\n{preview}"
             )
-            self.clear_form()
-        else:
-            messagebox.showerror("Lỗi", message)
+            if not failed_files:
+                self.clear_form()
 
     def clear_form(self):
         """Reset form về trạng thái ban đầu"""
         self.selected_file = None
+        self.selected_files = []
         self.open_password = ""
+        self.open_passwords = {}
         self.initial_restrictions = {}
         self.file_label.config(text="Chưa chọn file", fg="#666")
         self._set_password_fields("")
@@ -726,7 +927,7 @@ class PDFLockGUI:
             chk.config(fg="#000", font=("Consolas", 11, "normal"))
 
     def _update_lock_button_state(self):
-        if not self.selected_file:
+        if not self.selected_files:
             try:
                 self.btn_lock.config(state=tk.DISABLED)
             except Exception:
@@ -973,7 +1174,7 @@ def main():
                 if p and p.lower().endswith('.pdf') and os.path.exists(p)
             ]
             if arg_paths:
-                app.open_file(arg_paths[0])
+                app.open_files(arg_paths)
         root.mainloop()
     except Exception as exc:
         _write_startup_error(exc)

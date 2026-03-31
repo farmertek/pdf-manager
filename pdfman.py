@@ -5,10 +5,15 @@ from gui import Tooltip, IconButtonManager     # sử dụng Tooltip và IconBut
 from PIL import Image, ImageTk
 import fitz  # PyMuPDF
 from pypdf import PdfReader, PdfWriter
+try:
+    from pypdf.generic import Destination
+except Exception:  # pypdf version không hỗ trợ Destination
+    Destination = None  # type: ignore
 import os
 import sys
 import gc
 import ctypes
+import tempfile
 import tkinterdnd2
 from tkinterdnd2 import DND_FILES, DND_TEXT
 import shutil
@@ -57,6 +62,8 @@ class PDFManagerApp:
 
         # --- Các biến trạng thái ---
         self.current_pdf_path = None
+        self.original_pdf_path = None  # File gốc khi mở (để gợi ý Save và không ghi đè khi Add PDF)
+        self._has_unsaved_append = False  # True khi đã Add PDF nhưng chưa Save (để coi là "có thay đổi")
         self.opened_file_count = 0
         self.page_images = {}  # Dict: visual_idx -> PhotoImage (chỉ lưu trang đã render)
         self.page_checkboxes = [] # Lưu trữ các biến của checkbox (IntVar)
@@ -73,6 +80,7 @@ class PDFManagerApp:
         self.btn_close_pdf = None  # Tham chiếu nút Close PDF
         self.btn_select_all = None  # Tham chiếu nút Select All/Deselect All
         self.select_all_state = False  # False = Deselect All, True = Select All
+        self.last_clicked_page_idx = None  # Trang anchor cho Shift+Click (chọn khoảng)
         self.action_widgets = []  # Danh sách widgets trong action_frame
         self.bottom_widgets = []  # Danh sách widgets trong bottom_frame
         
@@ -86,7 +94,8 @@ class PDFManagerApp:
         self._gc_pending = 0  # Đếm số trang đã unload, gọi gc.collect() sau mỗi batch
         
         # --- Temp folder management ---
-        self.temp_dir = os.path.join(self.base_dir, "temp")
+        # Dùng thư mục temp của Windows để tránh lỗi ghi khi app nằm trong Program Files
+        self.temp_dir = os.path.join(tempfile.gettempdir(), "pdfman_temp")
         self.backup_pdf_path = None
         self.combined_pdf_path = None
         self._create_temp_dir()
@@ -149,7 +158,7 @@ class PDFManagerApp:
         # self.btn_select_all = self.icon_manager.create_button_with_icon(action_frame, 'select_all.png', (font_size_action * 2, font_size_action * 2), "Select All", self.toggle_select_all, text_color="#9400D3", font_size=font_size_action)
         self.btn_select_all = tk.Button(action_frame, width=14, text="☑ Select All", command=self.toggle_select_all, fg="#9400D3", font=("Consolas", font_size_action))
         self.btn_select_all.pack(side=tk.LEFT, padx=(5,5))
-        Tooltip(self.btn_select_all, "Chọn hoặc bỏ chọn tất cả các trang hiển thị")
+        Tooltip(self.btn_select_all, "Chọn hoặc bỏ chọn tất cả các trang hiển thị\n(Shift+Click: chọn một khoảng trang liên tiếp)")
 
         btn_rotate_cw = self.icon_manager.create_button_with_icon(action_frame, 'rotate_cw.png', (font_size_action * 2, font_size_action * 2), "+90°", lambda: self.rotate_selected_pages(90), text_color="blue", font_size=font_size_action)
         btn_rotate_cw.pack(side=tk.LEFT, padx=(5,1))
@@ -221,6 +230,9 @@ class PDFManagerApp:
         scrollbar_x.grid(row=1, column=0, sticky="ew")
         main_container.grid_rowconfigure(0, weight=1)
         main_container.grid_columnconfigure(0, weight=1)
+
+        # Phím tắt: Esc để bỏ chọn tất cả trang
+        self.root.bind_all("<Escape>", self.on_escape_clear_selection)
 
         # Hỗ trợ cuộn chuột và zoom bằng Ctrl+cuộn chuột
         self.canvas.bind_all("<MouseWheel>", self.on_mouse_wheel)
@@ -417,7 +429,8 @@ class PDFManagerApp:
         if self.opened_file_count > 1:
             self.lbl_file_info.config(text=f"Đang mở: {self.opened_file_count} file PDF")
         else:
-            self.lbl_file_info.config(text=f"Đang mở: {os.path.basename(self.current_pdf_path)}")
+            name = os.path.basename(self.original_pdf_path or self.current_pdf_path)
+            self.lbl_file_info.config(text=f"Đang mở: {name}")
 
     def open_pdf_file(self, file_path):
         """
@@ -437,15 +450,18 @@ class PDFManagerApp:
             messagebox.showerror("Lỗi", "Chỉ chấp nhận file PDF (.pdf)")
             return False
         
-        # Kiểm tra và remove restrictions nếu có
-        if not self.check_and_remove_pdf_restrictions(file_path):
+        # Kiểm tra restrictions và lấy đường dẫn an toàn để mở (không ghi đè file gốc)
+        safe_open_path = self.check_and_remove_pdf_restrictions(file_path)
+        if not safe_open_path:
             return False  # Nếu file bị khóa không thể remove, không mở
         
         # === GIẢI PHÓNG BỘ NHỚ FILE CŨ TRƯỚC KHI MỞ FILE MỚI ===
         self._close_fitz_doc()
         self._force_cleanup_all_images()
         
-        self.current_pdf_path = file_path
+        self.current_pdf_path = safe_open_path
+        self.original_pdf_path = file_path
+        self._has_unsaved_append = False
         self.opened_file_count = 1
         self._update_file_info_label()
         self.rotation_states = {} # Reset trạng thái xoay khi mở file mới
@@ -504,11 +520,13 @@ class PDFManagerApp:
             messagebox.showerror("Lỗi", "Chỉ chấp nhận file PDF (.pdf)")
             return False
         
-        # Kiểm tra restrictions cho từng file
-        for p in list(valid_paths):
-            if not self.check_and_remove_pdf_restrictions(p):
-                valid_paths.remove(p)
-        if not valid_paths:
+        # Kiểm tra restrictions cho từng file và lấy danh sách path an toàn để xử lý
+        safe_paths = []
+        for p in valid_paths:
+            safe_path = self.check_and_remove_pdf_restrictions(p)
+            if safe_path:
+                safe_paths.append(safe_path)
+        if not safe_paths:
             return False
         if len(valid_paths) == 1:
             return self.open_pdf_file(valid_paths[0])
@@ -518,11 +536,13 @@ class PDFManagerApp:
         self._force_cleanup_all_images()
         
         # Gộp tất cả file vào file tạm
-        combined_path, total_pages = self._build_combined_pdf(valid_paths)
+        combined_path, total_pages = self._build_combined_pdf(safe_paths)
         if not combined_path:
             return False
         
         self.current_pdf_path = combined_path
+        self.original_pdf_path = valid_paths[0]  # Tên gợi ý khi Save
+        self._has_unsaved_append = False
         self.opened_file_count = len(valid_paths)
         self._update_file_info_label()
         self.rotation_states = {}
@@ -571,6 +591,8 @@ class PDFManagerApp:
                 pass
 
         self.current_pdf_path = None
+        self.original_pdf_path = None
+        self._has_unsaved_append = False
         self.opened_file_count = 0
         self.backup_pdf_path = None
         self.combined_pdf_path = None
@@ -600,8 +622,13 @@ class PDFManagerApp:
             total_pages = 0
             for p in file_paths:
                 reader = PdfReader(p)  # type: ignore
-                for page in reader.pages:
-                    writer.add_page(page)
+                # Append toàn bộ file, giữ nguyên bookmark/outline
+                try:
+                    writer.append(reader, import_outline=True)  # type: ignore[arg-type]
+                except TypeError:
+                    # Fallback nếu phiên bản pypdf không hỗ trợ append(reader)
+                    for page in reader.pages:
+                        writer.add_page(page)
                 total_pages += len(reader.pages)
             
             with open(self.combined_pdf_path, "wb") as f:  # type: ignore
@@ -626,8 +653,8 @@ class PDFManagerApp:
             file_path: Đường dẫn file PDF
             
         Returns:
-            True nếu file không bị khóa hoặc đã remove thành công restrictions
-            False nếu file bị khóa không thể remove
+            Đường dẫn file an toàn để xử lý (file gốc hoặc file tạm đã remove restrictions)
+            None nếu file bị khóa không thể remove
         """
         try:
             # Mở file với pypdf để kiểm tra encryption
@@ -646,7 +673,7 @@ class PDFManagerApp:
                         "Không thể mở khóa file mà không có password.\n\n"
                         "Vui lòng nhập password hoặc chọn file khác."
                     )
-                    return False
+                    return None
                 
                 # Decrypt thành công → file chỉ có restrictions (không có password)
                 # Tạo PDF mới không có restrictions (không hiển thị thông báo thành công)
@@ -654,15 +681,30 @@ class PDFManagerApp:
                     writer = PdfWriter()
                     
                     # Copy tất cả pages từ reader sang writer
-                    for page_num in range(len(reader.pages)):
-                        page = reader.pages[page_num]
+                    for page in reader.pages:
                         writer.add_page(page)
+
+                    # Sao chép lại bookmark/outline (nếu có)
+                    try:
+                        self._build_outline_for_writer(
+                            reader=reader,
+                            writer=writer,
+                            page_index_map={i: i for i in range(len(reader.pages))}
+                        )
+                    except Exception:
+                        pass
                     
-                    # Ghi PDF mới không có restrictions
-                    with open(file_path, "wb") as output_file:
+                    # Ghi PDF mới không có restrictions vào file tạm (không ghi đè file gốc)
+                    fd, unlocked_path = tempfile.mkstemp(
+                        prefix="unlocked_",
+                        suffix=".pdf",
+                        dir=self.temp_dir,
+                    )
+                    os.close(fd)
+                    with open(unlocked_path, "wb") as output_file:
                         writer.write(output_file)
                     
-                    return True
+                    return unlocked_path
                     
                 except Exception as e:
                     messagebox.showerror(
@@ -670,10 +712,10 @@ class PDFManagerApp:
                         f"Không thể mở khóa file PDF:\n{str(e)}\n\n"
                         "Vui lòng kiểm tra file và thử lại."
                     )
-                    return False
+                    return None
             else:
                 # File không bị encrypt → không có restrictions
-                return True
+                return file_path
                 
         except Exception as e:
             messagebox.showerror(
@@ -681,16 +723,20 @@ class PDFManagerApp:
                 f"Không thể kiểm tra file PDF:\n{str(e)}\n\n"
                 "Vui lòng kiểm tra file và thử lại."
             )
-            return False
+            return None
 
-    def load_pdf_thumbnails(self):
-        """Tải PDF với lazy loading - chỉ render các trang đang hiển thị trong viewport"""
+    def load_pdf_thumbnails(self, preserved_selection=None):
+        """Tải PDF với lazy loading - chỉ render các trang đang hiển thị trong viewport.
+        
+        preserved_selection: tập các original page index cần giữ trạng thái đã chọn (khi zoom).
+        """
         # Đóng document cũ nếu có
         self._close_fitz_doc()
         
         # === GIẢI PHÓNG TRIỆT ĐỂ: ảnh, widgets, traces, refs ===
         # _force_cleanup_all_images đã xử lý: destroy widgets, clear lists, gc.collect, trim
         self._force_cleanup_all_images()
+        self.last_clicked_page_idx = None  # Reset anchor cho Shift+Click khi tải lại trang
         
         self._layout_dirty = True  # Đánh dấu layout đang thay đổi
         
@@ -702,14 +748,18 @@ class PDFManagerApp:
             self.fitz_doc = fitz.open(self.current_pdf_path)
             
             # Tính số cột dựa trên mức zoom
-            if self.zoom_level <= 0.25:
+            if self.zoom_level <= 0.20:
+                columns_per_row = 9
+            elif self.zoom_level <= 0.35:
+                columns_per_row = 7
+            elif self.zoom_level <= 0.50:
                 columns_per_row = 5
-            elif self.zoom_level <= 0.52:
-                columns_per_row = 3
+            elif self.zoom_level <= 0.65:
+                columns_per_row = 4
             elif self.zoom_level <= 0.80:
-                columns_per_row = 2
+                columns_per_row = 3
             else:
-                columns_per_row = 1
+                columns_per_row = 3
             
             row_count = 0
             col_count = 0
@@ -762,14 +812,18 @@ class PDFManagerApp:
                 on_change = lambda *args, var=chk_var, elements=color_elements: self.update_page_colors(var, elements)
                 chk_var.trace("w", on_change)
                 
+                # Nếu có preserved_selection (do zoom) thì khôi phục trạng thái chọn
+                if preserved_selection is not None and i in preserved_selection:
+                    chk_var.set(1)
+                
                 # 3. Placeholder image (dùng pixel image trick để set kích thước pixel)
                 # Chỉ tạo khung giữ chỗ, ảnh thật sẽ được render khi trang hiển thị (lazy loading)
                 lbl_img = tk.Label(page_container, image=self._pixel_img, width=base_w, height=base_h, bg="#d0d0d0", compound='center')
                 lbl_img.pack()
                 
-                # Bind click event vào toàn bộ trang để toggle selection
+                # Bind click event: Click=chọn/bỏ từng trang, Shift+Click=chọn khoảng
                 for w in [page_container, header_frame, chk, lbl_angle, lbl_img]:
-                    w.bind("<Button-1>", lambda event, var=chk_var: self.toggle_page_selection(var))
+                    w.bind("<Button-1>", lambda e, var=chk_var, idx=visual_idx: self.on_page_click(e, var, idx))
                 
                 # Lưu thông tin trang cho lazy loading
                 page_info = {
@@ -805,8 +859,26 @@ class PDFManagerApp:
             self._layout_dirty = False
             messagebox.showerror("Lỗi", f"Không thể đọc file PDF: {e}")
 
+    def on_page_click(self, event, chk_var, visual_idx):
+        """Xử lý click chọn trang: Click=chọn/bỏ từng trang, Shift+Click=chọn khoảng"""
+        shift = bool(event.state & 0x1)  # Shift
+        if shift:
+            # Chọn khoảng từ last_clicked đến visual_idx (giữ nguyên các trang khác)
+            anchor = self.last_clicked_page_idx if self.last_clicked_page_idx is not None else visual_idx
+            start = min(anchor, visual_idx)
+            end = max(anchor, visual_idx)
+            for i in range(start, end + 1):
+                if i < len(self.page_checkboxes):
+                    self.page_checkboxes[i].set(1)
+        else:
+            # Click thường: toggle như cách chọn cũ
+            current_value = chk_var.get()
+            chk_var.set(1 - current_value)
+        # Cập nhật anchor cho lần Shift+Click tiếp theo
+        self.last_clicked_page_idx = visual_idx
+
     def toggle_page_selection(self, chk_var):
-        """Toggle trạng thái checkbox khi click vào trang"""
+        """Toggle trạng thái checkbox khi click vào trang (giữ tương thích nếu gọi trực tiếp)"""
         current_value = chk_var.get()
         chk_var.set(1 - current_value)  # Toggle giữa 0 và 1
 
@@ -944,6 +1016,215 @@ class PDFManagerApp:
         except Exception:
             pass
     
+    # --- Bookmark / Outline helpers ---
+
+    def _move_pages_with_fitz(self, path_in: str, path_out: str, orig_at_position: list, page_index_map: dict) -> bool:
+        """
+        Di chuyển trang và map lại bookmark bằng PyMuPDF (get_toc/set_toc).
+        orig_at_position[new_idx] = index trang gốc tại vị trí mới.
+        page_index_map[old_index] = new_index (0-based).
+        Trả về True nếu thành công, False để fallback sang pypdf.
+        """
+        doc = None
+        new_doc = None
+        temp_output_path = None
+        try:
+            doc = fitz.open(path_in)
+            n_pages = len(doc)
+            if n_pages != len(orig_at_position):
+                return False
+            new_doc = fitz.open()
+            for i in range(n_pages):
+                old_idx = orig_at_position[i]
+                new_doc.insert_pdf(doc, from_page=old_idx, to_page=old_idx)
+            # PyMuPDF get_toc(simple=True): [level, title, page] với page 1-based.
+            toc = doc.get_toc(simple=True)
+            if toc:
+                # Map lại đích trang bookmark, sau đó sắp xếp theo cây cha/con.
+                # Chỉ reorder giữa các node cùng cấp để giữ nguyên quan hệ parent/child tuyệt đối.
+                mapped = []
+                for order, item in enumerate(toc):
+                    if len(item) >= 3:
+                        level, title, old_p = item[0], item[1], item[2]
+                        try:
+                            old_page_1based = int(old_p)
+                        except Exception:
+                            old_page_1based = 0
+
+                        if old_page_1based <= 0:
+                            new_page_1based = 0
+                        else:
+                            old_idx_0based = old_page_1based - 1
+                            new_idx_0based = page_index_map.get(old_idx_0based, old_idx_0based)
+                            new_page_1based = max(1, int(new_idx_0based) + 1)
+
+                        mapped.append(
+                            {
+                                "level": max(1, int(level)),
+                                "title": title,
+                                "page": new_page_1based,
+                                "order": order,
+                                "children": [],
+                            }
+                        )
+
+                if mapped:
+                    roots = []
+                    stack = []
+                    for node in mapped:
+                        level = node["level"]
+                        while stack and stack[-1]["level"] >= level:
+                            stack.pop()
+                        if stack:
+                            stack[-1]["children"].append(node)
+                        else:
+                            roots.append(node)
+                        stack.append(node)
+
+                    def _node_min_page(node):
+                        values = []
+                        if node["page"] > 0:
+                            values.append(node["page"])
+                        for child in node["children"]:
+                            values.append(_node_min_page(child))
+                        if values:
+                            return min(values)
+                        return n_pages + node["order"] + 1
+
+                    def _sort_tree(nodes):
+                        for node in nodes:
+                            _sort_tree(node["children"])
+                        nodes.sort(key=lambda n: (_node_min_page(n), n["order"]))
+
+                    def _flatten(nodes, out):
+                        for node in nodes:
+                            out.append([node["level"], node["title"], node["page"]])
+                            _flatten(node["children"], out)
+
+                    _sort_tree(roots)
+                    new_toc = []
+                    _flatten(roots, new_toc)
+
+                    try:
+                        new_doc.set_toc(new_toc)
+                    except Exception:
+                        # Fallback: chỉ chuẩn hóa tối thiểu khi PyMuPDF từ chối cấu trúc level.
+                        fixed_toc = []
+                        prev_level = 0
+                        for lvl, title, page in new_toc:
+                            try:
+                                cur = int(lvl)
+                            except Exception:
+                                cur = 1
+                            if cur < 1:
+                                cur = 1
+                            if prev_level == 0 and cur != 1:
+                                cur = 1
+                            elif prev_level > 0 and cur > prev_level + 1:
+                                cur = prev_level + 1
+                            fixed_toc.append([cur, title, page])
+                            prev_level = cur
+                        new_doc.set_toc(fixed_toc)
+            save_target = path_out
+            if os.path.abspath(path_in) == os.path.abspath(path_out):
+                out_dir = os.path.dirname(path_out) or os.getcwd()
+                fd, temp_output_path = tempfile.mkstemp(prefix="pdfman_reorder_", suffix=".pdf", dir=out_dir)
+                os.close(fd)
+                save_target = temp_output_path
+
+            new_doc.save(save_target)
+            if temp_output_path:
+                # Windows không cho replace khi file đang còn handle mở.
+                new_doc.close()
+                new_doc = None
+                doc.close()
+                doc = None
+                os.replace(temp_output_path, path_out)
+                temp_output_path = None
+            return True
+        except Exception:
+            return False
+        finally:
+            if new_doc is not None:
+                try:
+                    new_doc.close()
+                except Exception:
+                    pass
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
+            if temp_output_path and os.path.exists(temp_output_path):
+                try:
+                    os.remove(temp_output_path)
+                except Exception:
+                    pass
+
+    def _build_outline_for_writer(self, reader, writer, page_index_map=None):
+        """
+        Sao chép/cập nhật toàn bộ outline từ reader sang writer.
+        
+        page_index_map: dict[old_index] -> new_index
+        Nếu None: dùng ánh xạ 1-1 (0..N-1).
+        """
+        if Destination is None:
+            return
+        destination_cls = Destination
+        try:
+            outlines = reader.outline
+        except Exception:
+            return
+
+        if not outlines:
+            return
+
+        if page_index_map is None:
+            page_index_map = {i: i for i in range(len(reader.pages))}
+
+        def _add_outline_list_simple(items, parent=None):
+            """Duyệt outline gốc [Dest, list?, Dest, ...] giữ nguyên thứ tự, chỉ map page."""
+            i = 0
+            while i < len(items):
+                it = items[i]
+                if isinstance(it, list):
+                    _add_outline_list_simple(it, parent=parent)
+                    i += 1
+                    continue
+                if not isinstance(it, destination_cls):
+                    i += 1
+                    continue
+                try:
+                    old_page = reader.get_destination_page_number(it)
+                except Exception:
+                    i += 1
+                    continue
+                if old_page is None or int(old_page) not in page_index_map:
+                    i += 1
+                    continue
+                new_page = page_index_map[int(old_page)]
+                try:
+                    title = getattr(it, "title", "") or ""
+                except Exception:
+                    title = ""
+                try:
+                    created = writer.add_outline_item(title=title, page_number=new_page, parent=parent)
+                except Exception:
+                    i += 1
+                    continue
+                if i + 1 < len(items) and isinstance(items[i + 1], list):
+                    _add_outline_list_simple(items[i + 1], parent=created)
+                    i += 2
+                else:
+                    i += 1
+
+        try:
+            # Giữ nguyên thứ tự bookmark (không sort) để không bị "di chuyển cả cụm cha con"
+            _add_outline_list_simple(outlines, parent=None)
+        except Exception:
+            # Không để lỗi outline làm hỏng quá trình ghi PDF
+            return
+    
     def _on_yscroll_set(self, *args):
         """Wrapper cho scrollbar set - kích hoạt kiểm tra lazy loading khi scroll"""
         self.scrollbar_y.set(*args)
@@ -1035,10 +1316,14 @@ class PDFManagerApp:
     
     def _get_dpi_quality(self):
         """Tính chất lượng DPI dựa trên zoom level"""
-        if self.zoom_level <= 0.52:
-            return 0.8
+        if self.zoom_level <= 0.50:
+            return 1.0
         elif self.zoom_level <= 0.80:
             return 0.9
+        elif self.zoom_level <= 1.20:
+            return 0.8
+        elif self.zoom_level <= 2.50:
+            return 0.75
         else:
             return 1.0
     
@@ -1185,6 +1470,18 @@ class PDFManagerApp:
             self.btn_select_all.config(text="☐ Deselect All")  # type: ignore
             self.select_all_state = True
 
+    def on_escape_clear_selection(self, event=None):
+        """Nhấn Esc: bỏ chọn tất cả các trang và đưa nút về trạng thái Select All"""
+        if not self.page_checkboxes:
+            return
+        for chk in self.page_checkboxes:
+            chk.set(0)
+        self.last_clicked_page_idx = None
+        self.select_all_state = False
+        if self.btn_select_all:
+            self.btn_select_all.config(text="☑ Select All")
+        self.update_selected_count()
+
     def update_page_colors(self, chk_var, color_elements):
         """Cập nhật màu của tất cả elements (header, checkbox, label) khi trang được chọn/bỏ chọn"""
         if chk_var.get() == 1:  # Trang được chọn
@@ -1206,7 +1503,7 @@ class PDFManagerApp:
         self.lbl_selected_count.config(text=f"| Đã chọn: {selected_count}")
 
     def apply_zoom(self):
-        """Áp dụng tỷ lệ zoom từ ô nhập liệu"""
+        """Áp dụng tỷ lệ zoom từ ô nhập liệu (giữ nguyên trạng thái các trang đang được chọn)."""
         try:
             # Hủy timer zoom chuột nếu đang chạy
             if self.zoom_timer is not None:
@@ -1214,12 +1511,22 @@ class PDFManagerApp:
                 self.zoom_timer = None
             
             zoom_percent = int(self.zoom_entry.get())
-            if zoom_percent < 10 or zoom_percent > 500:
-                messagebox.showerror("Lỗi", "Tỷ lệ zoom phải nằm trong khoảng 10% - 500%")
+            if zoom_percent < 10 or zoom_percent > 250:
+                messagebox.showerror("Lỗi", "Tỷ lệ zoom phải nằm trong khoảng 10% - 250%")
                 return
+
+            # Lưu lại danh sách trang đang được chọn (theo original index)
+            preserved_selected = set()
+            for visual_idx, chk in enumerate(self.page_checkboxes):
+                try:
+                    if chk.get() == 1 and visual_idx < len(self.page_original_indices):
+                        preserved_selected.add(self.page_original_indices[visual_idx])
+                except Exception:
+                    continue
+
             self.zoom_level = zoom_percent / 100
             if self.current_pdf_path:
-                self.load_pdf_thumbnails()
+                self.load_pdf_thumbnails(preserved_selection=preserved_selected)
         except ValueError:
             messagebox.showerror("Lỗi", "Vui lòng nhập một số nguyên hợp lệ")
     
@@ -1243,6 +1550,15 @@ class PDFManagerApp:
         # delta > 0 = scroll up = zoom in, delta < 0 = scroll down = zoom out
         zoom_increment = 0.05  # Tăng/giảm 5% mỗi lần scroll
         
+        # Lưu lại danh sách trang đang được chọn (theo original index)
+        preserved_selected = set()
+        for visual_idx, chk in enumerate(self.page_checkboxes):
+            try:
+                if chk.get() == 1 and visual_idx < len(self.page_original_indices):
+                    preserved_selected.add(self.page_original_indices[visual_idx])
+            except Exception:
+                continue
+        
         if event.delta > 0:
             # Zoom in (scroll up / wheel up)
             new_zoom = self.zoom_level + zoom_increment
@@ -1250,7 +1566,7 @@ class PDFManagerApp:
             # Zoom out (scroll down / wheel down)
             new_zoom = self.zoom_level - zoom_increment
         
-        # Giới hạn zoom trong khoảng 10% - 500%
+        # Giới hạn zoom trong khoảng 10% - 250%
         new_zoom = max(0.10, min(5.00, new_zoom))
         
         # Cập nhật zoom level và entry (nhanh, không chờ)
@@ -1266,9 +1582,11 @@ class PDFManagerApp:
         # Đánh dấu layout đang thay đổi - ngăn lazy loading render với zoom cũ
         self._layout_dirty = True
         
-        # Lên lịch reload thumbnails sau 300ms (debouncing)
+        # Lên lịch reload thumbnails sau 300ms (debouncing) và giữ lại trạng thái chọn
         # Cách này giúp zoom mượt vì chỉ reload một lần khi user dừng zoom
-        self.zoom_timer = self.root.after(300, self.load_pdf_thumbnails)
+        self.zoom_timer = self.root.after(
+            300, lambda sel=preserved_selected: self.load_pdf_thumbnails(preserved_selection=sel)
+        )
 
     def rotate_selected_pages(self, angle_change):
         if not self.current_pdf_path:
@@ -1326,6 +1644,10 @@ class PDFManagerApp:
     
     def move_selected_pages(self, direction):
         """Di chuyển các trang được chọn lên trên hoặc xuống dưới"""
+        if not self.current_pdf_path:
+            return
+        current_path = self.current_pdf_path
+
         selected_pages = sorted([i for i, chk in enumerate(self.page_checkboxes) if chk.get() == 1])
         
         if not selected_pages:
@@ -1341,61 +1663,75 @@ class PDFManagerApp:
         self._close_fitz_doc()
         
         try:
-            # Đọc file hiện tại
-            reader = PdfReader(self.current_pdf_path)  # type: ignore
-            pages_list = list(reader.pages)
-            new_selected_pages: list[int] = []  # Khởi tạo biến
+            # Lấy số trang (PyMuPDF) để tính thứ tự mới
+            try:
+                doc = fitz.open(current_path)
+                n_pages = len(doc)
+                doc.close()
+            except Exception:
+                messagebox.showerror("Lỗi", "Không thể đọc file PDF.")
+                return
+            if n_pages == 0:
+                return
+            # orig_at_position[new_idx] = index trang gốc tại vị trí mới (chỉ dùng chỉ số)
+            orig_at_position = list(range(n_pages))
+            new_selected_pages: list[int] = []
             
-            # Di chuyển trang
             if direction == -1:  # Di chuyển lên trên
-                # Kiểm tra xem trang đầu tiên có thể di chuyển được không
                 if selected_pages[0] == 0:
                     messagebox.showinfo("Thông báo", "Không thể di chuyển - các trang đã ở vị trí đầu tiên.")
                     return
-                
-                # Di chuyển lên: lấy trang trước trang được chọn đầu tiên, sau đó insert vào cuối trang được chọn
                 for idx in selected_pages:
-                    page_to_move = pages_list.pop(idx - 1)
-                    pages_list.insert(idx, page_to_move)
-                
-                # Cập nhật index trong rotation_states và deleted_pages
+                    val = orig_at_position.pop(idx - 1)
+                    orig_at_position.insert(idx, val)
                 self.update_page_indices_after_move(selected_pages, direction)
-                
-                # Tính vị trí mới của trang sau khi di chuyển
                 new_selected_pages = [p - 1 for p in selected_pages]
-            
             elif direction == 1:  # Di chuyển xuống dưới
-                # Kiểm tra xem trang cuối cùng có thể di chuyển được không
-                if selected_pages[-1] == len(pages_list) - 1:
+                if selected_pages[-1] == n_pages - 1:
                     messagebox.showinfo("Thông báo", "Không thể di chuyển - các trang đã ở vị trí cuối cùng.")
                     return
-                
-                # Di chuyển xuống: lấy trang sau trang được chọn cuối cùng, sau đó insert vào đầu trang được chọn
                 for idx in reversed(selected_pages):
-                    page_to_move = pages_list.pop(idx + 1)
-                    pages_list.insert(idx, page_to_move)
-                
-                # Cập nhật index trong rotation_states và deleted_pages
+                    val = orig_at_position.pop(idx + 1)
+                    orig_at_position.insert(idx, val)
                 self.update_page_indices_after_move(selected_pages, direction)
-                
-                # Tính vị trí mới của trang sau khi di chuyển
                 new_selected_pages = [p + 1 for p in selected_pages]
             
-            # Ghi lại file
+            page_index_map = {orig_at_position[i]: i for i in range(n_pages)}
+            write_path = current_path
+            if not self._is_path_in_temp(current_path):
+                write_path = os.path.join(self.temp_dir, "working_reordered.pdf")
+            
+            # Ưu tiên PyMuPDF để map bookmark đúng theo trang mới
+            if self._move_pages_with_fitz(current_path, write_path, orig_at_position, page_index_map):
+                self.current_pdf_path = write_path
+                self._has_unsaved_append = True
+                self.load_pdf_thumbnails()
+                self.update_page_count()
+                for idx in new_selected_pages:
+                    if idx < len(self.page_checkboxes):
+                        self.page_checkboxes[idx].set(1)
+                return
+            # Fallback: pypdf (bookmark có thể không theo trang)
+            reader = PdfReader(current_path)  # type: ignore
+            pages_list = [reader.pages[orig_at_position[i]] for i in range(n_pages)]
             writer = PdfWriter()
             for page in pages_list:
                 writer.add_page(page)
-            
-            with open(self.current_pdf_path, "wb") as f:  # type: ignore
+            try:
+                self._build_outline_for_writer(reader=reader, writer=writer, page_index_map=page_index_map)
+            except Exception:
+                pass
+            if not self._is_path_in_temp(current_path):
+                write_path = os.path.join(self.temp_dir, "working_reordered.pdf")
+                self.current_pdf_path = write_path
+            with open(write_path, "wb") as f:  # type: ignore
                 writer.write(f)
-            
+            self._has_unsaved_append = True
             self.load_pdf_thumbnails()
             self.update_page_count()
-            # Khôi phục checkbox ở vị trí MỚI
             for idx in new_selected_pages:
                 if idx < len(self.page_checkboxes):
                     self.page_checkboxes[idx].set(1)
-            
         except Exception as e:
             messagebox.showerror("Lỗi", f"Không thể di chuyển trang: {e}")
     
@@ -1482,7 +1818,7 @@ class PDFManagerApp:
         output_path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf")],
-            initialfile=os.path.basename(self.current_pdf_path)
+            initialfile=os.path.basename(self.original_pdf_path or self.current_pdf_path)
         )
 
         if output_path:
@@ -1505,17 +1841,31 @@ class PDFManagerApp:
                 reader = PdfReader(self.current_pdf_path)  # type: ignore
                 writer = PdfWriter()
 
-                for i in range(len(reader.pages)):
-                    # Bỏ qua các trang bị xóa
+                # Ánh xạ index trang cũ -> index trang mới sau khi xóa
+                page_index_map = {}
+                new_idx = 0
+                for i, page in enumerate(reader.pages):
                     if i in self.deleted_pages:
                         continue
-                    
-                    page = reader.pages[i]
-                    # Lấy góc xoay từ dictionary trạng thái (nếu không có thì là 0)
                     angle = self.rotation_states.get(i, 0)
                     if angle != 0:
-                        page.rotate(angle)
+                        try:
+                            page.rotate(angle)
+                        except Exception:
+                            pass
                     writer.add_page(page)
+                    page_index_map[i] = new_idx
+                    new_idx += 1
+
+                # Xây lại bookmark/outline dựa trên mapping trang mới
+                try:
+                    self._build_outline_for_writer(
+                        reader=reader,
+                        writer=writer,
+                        page_index_map=page_index_map,
+                    )
+                except Exception:
+                    pass
 
                 with open(output_path, "wb") as f:  # type: ignore
                     writer.write(f)
@@ -1528,6 +1878,7 @@ class PDFManagerApp:
                 # Cập nhật trạng thái ban đầu sau khi lưu
                 self.initial_rotation_states = self.rotation_states.copy()
                 self.deleted_pages = set()  # Reset danh sách xóa
+                self._has_unsaved_append = False
                 
                 # Mở lại fitz document sau khi ghi
                 try:
@@ -1545,7 +1896,11 @@ class PDFManagerApp:
     
     def is_file_modified(self):
         """Kiểm tra xem file PDF có thay đổi so với lần mở/lưu cuối cùng không"""
-        return (self.rotation_states != self.initial_rotation_states) or bool(self.deleted_pages)
+        return (
+            (self.rotation_states != self.initial_rotation_states)
+            or bool(self.deleted_pages)
+            or self._has_unsaved_append
+        )
     
     def update_page_count(self):
         """Cập nhật và hiển thị số lượng trang hiện tại"""
@@ -1581,13 +1936,16 @@ class PDFManagerApp:
             return
         
         if messagebox.askyesno("Xác nhận Reset All", "Bạn có chắc chắn muốn khôi phục toàn bộ những thay đổi?\n\n(Tất cả xoay trang, xóa trang và thêm trang sẽ bị hủy)"):
-            # Khôi phục từ backup file trong temp folder
+            # Luôn khôi phục nội dung từ backup (kể cả outline) để bookmark trở về đúng vị trí ban đầu
             if self.backup_pdf_path and os.path.exists(self.backup_pdf_path):
                 try:
                     shutil.copy2(self.backup_pdf_path, self.current_pdf_path)
                 except Exception as e:
                     messagebox.showerror("Lỗi", f"Không thể khôi phục file PDF: {e}")
                     return
+            # Nếu không có backup (hiếm), chỉ chuyển về file gốc khi đang dùng file tạm
+            elif self._is_path_in_temp(self.current_pdf_path) and self.original_pdf_path and os.path.exists(self.original_pdf_path):
+                self.current_pdf_path = self.original_pdf_path
             
             # === GIẢI PHÓNG BỘ NHỚ TRIỆT ĐỂ TRƯỚC KHI TẢI LẠI ===
             self._close_fitz_doc()
@@ -1597,6 +1955,7 @@ class PDFManagerApp:
             self.rotation_states = {}
             self.initial_rotation_states = {}
             self.deleted_pages = set()
+            self._has_unsaved_append = False
             
             # Tải lại file PDF (load_pdf_thumbnails sẽ mở fitz_doc mới)
             self.load_pdf_thumbnails()
@@ -1640,11 +1999,13 @@ class PDFManagerApp:
             messagebox.showerror("Lỗi", "Chỉ chấp nhận file PDF (.pdf)")
             return
         
-        # Kiểm tra restrictions cho từng file
-        for p in list(valid_paths):
-            if not self.check_and_remove_pdf_restrictions(p):
-                valid_paths.remove(p)
-        if not valid_paths:
+        # Kiểm tra restrictions cho từng file và lấy danh sách path an toàn để xử lý
+        safe_paths = []
+        for p in valid_paths:
+            safe_path = self.check_and_remove_pdf_restrictions(p)
+            if safe_path:
+                safe_paths.append(safe_path)
+        if not safe_paths:
             return
         
         # Đóng fitz document trước khi ghi file
@@ -1655,19 +2016,21 @@ class PDFManagerApp:
             if self.backup_pdf_path is None or (self.backup_pdf_path and not os.path.exists(self.backup_pdf_path)):  # type: ignore
                 self._backup_pdf()
             
-            # Đọc file hiện tại
-            reader_current = PdfReader(self.current_pdf_path)  # type: ignore
             writer = PdfWriter()
+            reader_current = PdfReader(self.current_pdf_path)  # type: ignore
             
             # Đọc các file mới và tính tổng số trang
-            readers_new = [PdfReader(p) for p in valid_paths]  # type: ignore
+            readers_new = [PdfReader(p) for p in safe_paths]  # type: ignore
             new_pages_count = sum(len(r.pages) for r in readers_new)
             
             if position == "start":
-                # Thêm trang từ file mới vào đầu
+                # Thêm các file mới vào đầu, giữ bookmark/outline của từng file
                 for r in readers_new:
-                    for page in r.pages:
-                        writer.add_page(page)
+                    try:
+                        writer.append(r, import_outline=True)  # type: ignore[arg-type]
+                    except TypeError:
+                        for page in r.pages:
+                            writer.add_page(page)
                 
                 # Cập nhật rotation_states: dịch tất cả các index hiện tại
                 new_rotation_states = {}
@@ -1681,26 +2044,40 @@ class PDFManagerApp:
                     new_deleted_pages.add(old_idx + new_pages_count)
                 self.deleted_pages = new_deleted_pages
                 
-                # Thêm trang từ file hiện tại
-                for page in reader_current.pages:
-                    writer.add_page(page)
-            else:
-                # Thêm trang từ file hiện tại
-                for page in reader_current.pages:
-                    writer.add_page(page)
-                
-                # Thêm trang từ file mới vào cuối
-                for r in readers_new:
-                    for page in r.pages:
+                # Thêm file hiện tại vào sau cùng (vẫn giữ outline cũ)
+                try:
+                    writer.append(reader_current, import_outline=True)  # type: ignore[arg-type]
+                except TypeError:
+                    for page in reader_current.pages:
                         writer.add_page(page)
+            else:
+                # Thêm file hiện tại trước
+                try:
+                    writer.append(reader_current, import_outline=True)  # type: ignore[arg-type]
+                except TypeError:
+                    for page in reader_current.pages:
+                        writer.add_page(page)
+                
+                # Thêm file mới vào cuối
+                for r in readers_new:
+                    try:
+                        writer.append(r, import_outline=True)  # type: ignore[arg-type]
+                    except TypeError:
+                        for page in r.pages:
+                            writer.add_page(page)
             
-            # Lưu tạm thời vào file hiện tại
-            with open(self.current_pdf_path, "wb") as f:  # type: ignore
+            # Không ghi đè file gốc: nếu đang mở file ngoài temp thì ghi vào file tạm
+            write_path = self.current_pdf_path
+            if not self._is_path_in_temp(self.current_pdf_path):
+                write_path = os.path.join(self.temp_dir, "working_merged.pdf")
+                self.current_pdf_path = write_path
+            with open(write_path, "wb") as f:  # type: ignore
                 writer.write(f)
 
+            self._has_unsaved_append = True
             if self.opened_file_count <= 0:
                 self.opened_file_count = 1
-            self.opened_file_count += len(valid_paths)
+                self.opened_file_count += len(safe_paths)
             self._update_file_info_label()
             
             self.load_pdf_thumbnails()
@@ -1709,7 +2086,7 @@ class PDFManagerApp:
                 position_text = "đầu" if position == "start" else "cuối"
                 messagebox.showinfo(
                     "Thành công",
-                    f"Đã thêm {len(valid_paths)} file với tổng {new_pages_count} trang vào {position_text} file."
+                    f"Đã thêm {len(safe_paths)} file với tổng {new_pages_count} trang vào {position_text} file."
                 )
             
         except Exception as e:
@@ -1718,10 +2095,10 @@ class PDFManagerApp:
     def on_closing(self):
         """Xử lý sự kiện đóng cửa sổ"""
         if self.current_pdf_path and self.is_file_modified():
-            # Nếu file đã thay đổi, hỏi có lưu không
+            name = os.path.basename(self.original_pdf_path or self.current_pdf_path)
             response = messagebox.askyesnocancel(
                 "File chưa lưu",
-                f"File '{os.path.basename(self.current_pdf_path)}' có thay đổi chưa được lưu.\n\nBạn có muốn lưu file trước khi đóng không?"
+                f"File '{name}' có thay đổi chưa được lưu.\n\nBạn có muốn lưu file trước khi đóng không?"
             )
             if response is None:  # Nhấn Cancel
                 return
