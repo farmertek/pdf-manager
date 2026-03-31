@@ -24,3 +24,9 @@ Nếu có gì sơ sót mong các cao nhân bỏ qua ^^. Thank you very much!
 
 
 ![Lượt xem](https://hits.dwyl.com/farmertek/pdf-manager.svg)
+
+
+---
+## Phien ban lien quan
+- Browser Extension (Chromium): https://github.com/farmertek/pdfman-chromium-extension
+- Python PDF Manager (repo nay): https://github.com/farmertek/pdf-manager
